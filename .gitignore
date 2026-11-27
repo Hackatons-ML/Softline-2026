@@ -1,0 +1,26 @@
+# Large catalog feed (>100 MB GitHub limit) and generated local index artifacts
+Mindbox.yml.gz.xml
+storage/
+
+# Python artifacts & environments
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+env/
+.env
+*.log
+
+# Frontend dependencies (compiled dist/ is kept so `python run.py` works without Node.js)
+frontend/node_modules/
+frontend/.vite/
+
+# OS / IDE clutter
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.tmp
+*.bak
