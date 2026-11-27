@@ -10,6 +10,7 @@ Transforms the 292 MB XML feed (9,311 categories, 136,040 SKU offers) into:
 """
 
 from __future__ import annotations
+import gzip
 import json
 import math
 import pickle
@@ -19,7 +20,7 @@ import statistics
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, BinaryIO, Dict, List, Optional, Set, Tuple
 from lxml import etree
 import numpy as np
 from rank_bm25 import BM25Okapi
@@ -28,6 +29,7 @@ from backend.engine.embedder import LocalSemanticEmbedder
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_XML_PATH = PROJECT_ROOT / "Mindbox.yml.gz.xml"
+COMPRESSED_XML_PATH = PROJECT_ROOT / "Mindbox.yml.gz"
 STORAGE_DIR = PROJECT_ROOT / "storage"
 
 # Mixed Cyrillic-Latin homoglyph detector & normalizer
@@ -146,8 +148,26 @@ def split_head_tail_product(name: str) -> Tuple[str, str]:
     return head, tail
 
 
-def build_catalog_index(xml_path: Path = DEFAULT_XML_PATH, storage_dir: Path = STORAGE_DIR) -> Dict[str, Any]:
+def resolve_feed_path(preferred: Optional[Path] = None) -> Path:
+    for candidate in (preferred, DEFAULT_XML_PATH, COMPRESSED_XML_PATH):
+        if candidate is not None and candidate.exists():
+            return candidate
+    raise FileNotFoundError(
+        f"Catalog feed not found. Expected {COMPRESSED_XML_PATH} or {DEFAULT_XML_PATH}"
+    )
+
+
+def _open_feed_stream(path: Path) -> BinaryIO:
+    with open(path, "rb") as probe:
+        magic = probe.read(2)
+    if path.suffix.lower() == ".gz" or magic == b"\x1f\x8b":
+        return gzip.open(path, "rb")  # type: ignore[return-value]
+    return open(path, "rb")
+
+
+def build_catalog_index(xml_path: Optional[Path] = None, storage_dir: Path = STORAGE_DIR) -> Dict[str, Any]:
     t0 = time.perf_counter()
+    feed_path = resolve_feed_path(xml_path)
     storage_dir.mkdir(parents=True, exist_ok=True)
     db_path = storage_dir / "catalog.sqlite"
     emb_path = storage_dir / "group_embeddings.npy"
@@ -156,7 +176,7 @@ def build_catalog_index(xml_path: Path = DEFAULT_XML_PATH, storage_dir: Path = S
     if db_path.exists():
         db_path.unlink()
 
-    print(f"[1/5] Streaming XML catalog from {xml_path} ...")
+    print(f"[1/5] Streaming XML catalog from {feed_path} ...")
     categories: Dict[str, Dict[str, str]] = {}
     cat_children: Dict[str, List[str]] = defaultdict(list)
     audit_issues: List[Dict[str, str]] = []
@@ -195,245 +215,246 @@ def build_catalog_index(xml_path: Path = DEFAULT_XML_PATH, storage_dir: Path = S
     zero_price_inactive = 0
     homoglyph_offer_count = 0
 
-    context = etree.iterparse(
-        str(xml_path),
-        events=("end",),
-        tag=("category", "offer"),
-        load_dtd=False,
-        no_network=True,
-        recover=True,
-    )
+    with _open_feed_stream(feed_path) as feed_stream:
+        context = etree.iterparse(
+            feed_stream,
+            events=("end",),
+            tag=("category", "offer"),
+            load_dtd=False,
+            no_network=True,
+            recover=True,
+        )
 
-    for _, elem in context:
-        if elem.tag == "category":
-            cid = elem.attrib.get("id", "").strip()
-            pid = elem.attrib.get("parentId", "").strip()
-            raw_name = (elem.text or "").strip()
-            clean_name, defects = fix_homoglyphs(raw_name)
-            if defects and len(audit_issues) < 120:
-                audit_issues.append({
-                    "issue_type": "homoglyph_category",
-                    "entity_id": cid,
-                    "raw_value": raw_name,
-                    "detail": f"Смешение кириллицы и латиницы в названии категории ({', '.join(defects)}) — ломает точный поиск",
-                })
-            for bad, good in KNOWN_CATEGORY_TYPOS:
-                if bad.lower() in clean_name.lower():
+        for _, elem in context:
+            if elem.tag == "category":
+                cid = elem.attrib.get("id", "").strip()
+                pid = elem.attrib.get("parentId", "").strip()
+                raw_name = (elem.text or "").strip()
+                clean_name, defects = fix_homoglyphs(raw_name)
+                if defects and len(audit_issues) < 120:
                     audit_issues.append({
-                        "issue_type": "typo_category",
+                        "issue_type": "homoglyph_category",
                         "entity_id": cid,
                         "raw_value": raw_name,
-                        "detail": f"Опечатка в названии категории каталога: «{bad.strip()}» вместо «{good.strip()}»",
+                        "detail": f"Смешение кириллицы и латиницы в названии категории ({', '.join(defects)}) — ломает точный поиск",
                     })
-            categories[cid] = {
-                "id": cid,
-                "parent_id": pid,
-                "raw_name": raw_name,
-                "clean_name": clean_name,
-            }
-            if pid:
-                cat_children[pid].append(cid)
-            elem.clear()
-
-        elif elem.tag == "offer":
-            ensure_category_paths()
-            total_offers += 1
-            oid = elem.attrib.get("id", "").strip()
-            raw_gid = (elem.attrib.get("group_id") or elem.findtext("group_id") or "").strip()
-            available = elem.attrib.get("available", "false").strip().lower() == "true"
-            if available:
-                avail_offers += 1
-
-            raw_name = (elem.findtext("name") or "").strip()
-            clean_name, name_defects = fix_homoglyphs(raw_name)
-            if name_defects:
-                homoglyph_offer_count += 1
-                if len(audit_issues) < 160 and homoglyph_offer_count <= 20:
-                    audit_issues.append({
-                        "issue_type": "homoglyph_offer",
-                        "entity_id": oid,
-                        "raw_value": raw_name[:110],
-                        "detail": f"Кириллические/латинские буквы-двойники в карточке SKU: {', '.join(name_defects[:3])}",
-                    })
-
-            raw_vendor = (elem.findtext("vendor") or "").strip()
-            vendor, _ = fix_homoglyphs(raw_vendor)
-            vendor_url = (elem.findtext("vendorUrl") or "").strip()
-            url = (elem.findtext("url") or "").strip()
-            vendor_slug = extract_vendor_slug(vendor_url, url)
-            cat_id = (elem.findtext("categoryId") or "").strip()
-            picture = (elem.findtext("picture") or "").strip()
-            sales_notes = (elem.findtext("sales_notes") or "").strip()
-            desc = (elem.findtext("description") or "").strip()
-
-            try:
-                price = float((elem.findtext("price") or "0").strip() or 0.0)
-            except ValueError:
-                price = 0.0
-            try:
-                oldprice = float((elem.findtext("oldprice") or "0").strip() or 0.0)
-            except ValueError:
-                oldprice = 0.0
-
-            if not available and price <= 0:
-                zero_price_inactive += 1
-
-            discount_pct = 0.0
-            if oldprice > price > 0:
-                discount_pct = round((oldprice - price) / oldprice * 100.0, 1)
-
-            params: Dict[str, str] = {}
-            for p_el in elem.findall("param"):
-                pname = p_el.attrib.get("name", "").strip()
-                pval = (p_el.text or "").strip()
-                if pname and pval and pval.lower() != "другое или отсутствует":
-                    params[pname] = pval
-
-            prod_type = params.get("Тип продукта", "софт").lower()
-            registry_num = params.get("Номер записи в реестре отечественного ПО", "")
-            platform = params.get("Совместимая архитектура/платформа", "")
-            version = params.get("Версия", "")
-            license_type = params.get("Тип лицензии", "")
-            duration = params.get("Срок действия", "")
-            org_type = params.get("Тип организации", "")
-            certs = params.get("Сертификаты и стандарты", "")
-            nodes_cnt = params.get("К-во узлов", "") or params.get("К-во пользователей до", "")
-
-            if raw_gid:
-                gid = raw_gid
-                group_cat_info = categories.get(raw_gid)
-                group_title = group_cat_info["clean_name"] if group_cat_info else clean_name.split(",")[0].strip()
-            else:
-                gid = normalize_hw_model_key(clean_name, vendor, cat_id)
-                group_title = re.sub(r",\s*.*$", "", clean_name).strip()
-
-            is_secondary = bool(SECONDARY_SKU_PATTERNS.search(clean_name))
-            if prod_type == "электроника" and SERVER_ACCESSORY_PATTERNS.search(clean_name):
-                is_secondary = True
-
-            head_name, tail_target = split_head_tail_product(clean_name)
-            if tail_target and len(compatibility_raw) < 25000:
-                compatibility_raw.append((gid, tail_target, clean_name[:120]))
-
-            cat_info = categories.get(cat_id, {
-                "root_id": cat_id,
-                "root_name": "Каталог",
-                "level2_id": cat_id,
-                "level2_name": "Товары",
-                "clean_name": "Товары",
-                "full_path": "Каталог",
-            })
-            # Check if category itself is Минпромторг registry
-            is_ru_registry = bool(registry_num) or ("222320" in (cat_id, cat_info.get("level2_id", ""))) or (cat_info.get("root_id") == "353554")
-
-            offer_tuple = (
-                oid,
-                gid,
-                1 if available else 0,
-                clean_name,
-                head_name,
-                tail_target,
-                vendor,
-                vendor_url,
-                vendor_slug,
-                cat_id,
-                url,
-                picture,
-                price,
-                oldprice,
-                discount_pct,
-                prod_type,
-                1 if is_ru_registry else 0,
-                registry_num,
-                1 if is_secondary else 0,
-                version,
-                platform,
-                license_type,
-                duration,
-                org_type,
-                certs,
-                nodes_cnt,
-                sales_notes,
-                desc[:350],
-            )
-            offers_rows.append(offer_tuple)
-
-            # Aggregate into product group
-            g = groups_acc.get(gid)
-            if g is None:
-                g = {
-                    "group_id": gid,
-                    "title": group_title,
-                    "vendor": vendor,
-                    "vendor_url": vendor_url,
-                    "vendor_slug": vendor_slug,
-                    "category_id": cat_id,
-                    "root_category_id": cat_info.get("root_id", ""),
-                    "root_category_name": cat_info.get("root_name", ""),
-                    "sub_category_name": cat_info.get("clean_name", ""),
-                    "category_path": cat_info.get("full_path", ""),
-                    "product_type": prod_type,
-                    "total_sku_count": 0,
-                    "avail_sku_count": 0,
-                    "base_avail_sku_count": 0,
-                    "min_avail_price": math.inf,
-                    "max_avail_price": 0.0,
-                    "max_discount_pct": 0.0,
-                    "is_ru_registry": False,
-                    "registry_num": "",
-                    "platforms": set(),
-                    "versions": set(),
-                    "certs": set(),
-                    "sales_notes_set": set(),
-                    "best_offer": None,
-                    "best_offer_rank": (-1, -1, -1, -math.inf),
+                for bad, good in KNOWN_CATEGORY_TYPOS:
+                    if bad.lower() in clean_name.lower():
+                        audit_issues.append({
+                            "issue_type": "typo_category",
+                            "entity_id": cid,
+                            "raw_value": raw_name,
+                            "detail": f"Опечатка в названии категории каталога: «{bad.strip()}» вместо «{good.strip()}»",
+                        })
+                categories[cid] = {
+                    "id": cid,
+                    "parent_id": pid,
+                    "raw_name": raw_name,
+                    "clean_name": clean_name,
                 }
-                groups_acc[gid] = g
+                if pid:
+                    cat_children[pid].append(cid)
+                elem.clear()
 
-            g["total_sku_count"] += 1
-            if available:
-                g["avail_sku_count"] += 1
-                if not is_secondary:
-                    g["base_avail_sku_count"] += 1
-                if price > 0:
-                    if price < g["min_avail_price"]:
-                        g["min_avail_price"] = price
-                    if price > g["max_avail_price"]:
-                        g["max_avail_price"] = price
-            if discount_pct > g["max_discount_pct"] and available:
-                g["max_discount_pct"] = discount_pct
-            if is_ru_registry:
-                g["is_ru_registry"] = True
-                if registry_num and not g["registry_num"]:
-                    g["registry_num"] = registry_num
-            if platform and len(g["platforms"]) < 5:
-                g["platforms"].add(platform[:50])
-            if version and len(g["versions"]) < 5:
-                g["versions"].add(version[:25])
-            if certs and len(g["certs"]) < 4:
-                g["certs"].add(certs[:40])
-            if sales_notes and len(g["sales_notes_set"]) < 4:
-                g["sales_notes_set"].add(sales_notes)
+            elif elem.tag == "offer":
+                ensure_category_paths()
+                total_offers += 1
+                oid = elem.attrib.get("id", "").strip()
+                raw_gid = (elem.attrib.get("group_id") or elem.findtext("group_id") or "").strip()
+                available = elem.attrib.get("available", "false").strip().lower() == "true"
+                if available:
+                    avail_offers += 1
 
-            # Pick flagship offer:
-            # Prefer available=True -> non-secondary (base license/device) -> commercial/universal -> has discount or affordable real price
-            comm_bonus = 1 if ("коммерч" in org_type.lower() or not org_type) else 0
-            has_real_price = 1 if price > 0 else 0
-            # Prefer moderate starting price among base commercial SKUs (negative log price so 1-seat / standard base SKU beats 1000-seat bundle)
-            price_pref = -math.log10(price + 10.0) if price > 0 else -99.0
-            cand_rank = (
-                1 if available else 0,
-                1 if not is_secondary else 0,
-                has_real_price + comm_bonus,
-                (1.5 if discount_pct > 0 else 0.0) + price_pref,
-            )
-            if cand_rank > g["best_offer_rank"]:
-                g["best_offer_rank"] = cand_rank
-                g["best_offer"] = offer_tuple
+                raw_name = (elem.findtext("name") or "").strip()
+                clean_name, name_defects = fix_homoglyphs(raw_name)
+                if name_defects:
+                    homoglyph_offer_count += 1
+                    if len(audit_issues) < 160 and homoglyph_offer_count <= 20:
+                        audit_issues.append({
+                            "issue_type": "homoglyph_offer",
+                            "entity_id": oid,
+                            "raw_value": raw_name[:110],
+                            "detail": f"Кириллические/латинские буквы-двойники в карточке SKU: {', '.join(name_defects[:3])}",
+                        })
 
-            elem.clear()
-            while elem.getprevious() is not None:
-                del elem.getparent()[0]
+                raw_vendor = (elem.findtext("vendor") or "").strip()
+                vendor, _ = fix_homoglyphs(raw_vendor)
+                vendor_url = (elem.findtext("vendorUrl") or "").strip()
+                url = (elem.findtext("url") or "").strip()
+                vendor_slug = extract_vendor_slug(vendor_url, url)
+                cat_id = (elem.findtext("categoryId") or "").strip()
+                picture = (elem.findtext("picture") or "").strip()
+                sales_notes = (elem.findtext("sales_notes") or "").strip()
+                desc = (elem.findtext("description") or "").strip()
+
+                try:
+                    price = float((elem.findtext("price") or "0").strip() or 0.0)
+                except ValueError:
+                    price = 0.0
+                try:
+                    oldprice = float((elem.findtext("oldprice") or "0").strip() or 0.0)
+                except ValueError:
+                    oldprice = 0.0
+
+                if not available and price <= 0:
+                    zero_price_inactive += 1
+
+                discount_pct = 0.0
+                if oldprice > price > 0:
+                    discount_pct = round((oldprice - price) / oldprice * 100.0, 1)
+
+                params: Dict[str, str] = {}
+                for p_el in elem.findall("param"):
+                    pname = p_el.attrib.get("name", "").strip()
+                    pval = (p_el.text or "").strip()
+                    if pname and pval and pval.lower() != "другое или отсутствует":
+                        params[pname] = pval
+
+                prod_type = params.get("Тип продукта", "софт").lower()
+                registry_num = params.get("Номер записи в реестре отечественного ПО", "")
+                platform = params.get("Совместимая архитектура/платформа", "")
+                version = params.get("Версия", "")
+                license_type = params.get("Тип лицензии", "")
+                duration = params.get("Срок действия", "")
+                org_type = params.get("Тип организации", "")
+                certs = params.get("Сертификаты и стандарты", "")
+                nodes_cnt = params.get("К-во узлов", "") or params.get("К-во пользователей до", "")
+
+                if raw_gid:
+                    gid = raw_gid
+                    group_cat_info = categories.get(raw_gid)
+                    group_title = group_cat_info["clean_name"] if group_cat_info else clean_name.split(",")[0].strip()
+                else:
+                    gid = normalize_hw_model_key(clean_name, vendor, cat_id)
+                    group_title = re.sub(r",\s*.*$", "", clean_name).strip()
+
+                is_secondary = bool(SECONDARY_SKU_PATTERNS.search(clean_name))
+                if prod_type == "электроника" and SERVER_ACCESSORY_PATTERNS.search(clean_name):
+                    is_secondary = True
+
+                head_name, tail_target = split_head_tail_product(clean_name)
+                if tail_target and len(compatibility_raw) < 25000:
+                    compatibility_raw.append((gid, tail_target, clean_name[:120]))
+
+                cat_info = categories.get(cat_id, {
+                    "root_id": cat_id,
+                    "root_name": "Каталог",
+                    "level2_id": cat_id,
+                    "level2_name": "Товары",
+                    "clean_name": "Товары",
+                    "full_path": "Каталог",
+                })
+                # Check if category itself is Минпромторг registry
+                is_ru_registry = bool(registry_num) or ("222320" in (cat_id, cat_info.get("level2_id", ""))) or (cat_info.get("root_id") == "353554")
+
+                offer_tuple = (
+                    oid,
+                    gid,
+                    1 if available else 0,
+                    clean_name,
+                    head_name,
+                    tail_target,
+                    vendor,
+                    vendor_url,
+                    vendor_slug,
+                    cat_id,
+                    url,
+                    picture,
+                    price,
+                    oldprice,
+                    discount_pct,
+                    prod_type,
+                    1 if is_ru_registry else 0,
+                    registry_num,
+                    1 if is_secondary else 0,
+                    version,
+                    platform,
+                    license_type,
+                    duration,
+                    org_type,
+                    certs,
+                    nodes_cnt,
+                    sales_notes,
+                    desc[:350],
+                )
+                offers_rows.append(offer_tuple)
+
+                # Aggregate into product group
+                g = groups_acc.get(gid)
+                if g is None:
+                    g = {
+                        "group_id": gid,
+                        "title": group_title,
+                        "vendor": vendor,
+                        "vendor_url": vendor_url,
+                        "vendor_slug": vendor_slug,
+                        "category_id": cat_id,
+                        "root_category_id": cat_info.get("root_id", ""),
+                        "root_category_name": cat_info.get("root_name", ""),
+                        "sub_category_name": cat_info.get("clean_name", ""),
+                        "category_path": cat_info.get("full_path", ""),
+                        "product_type": prod_type,
+                        "total_sku_count": 0,
+                        "avail_sku_count": 0,
+                        "base_avail_sku_count": 0,
+                        "min_avail_price": math.inf,
+                        "max_avail_price": 0.0,
+                        "max_discount_pct": 0.0,
+                        "is_ru_registry": False,
+                        "registry_num": "",
+                        "platforms": set(),
+                        "versions": set(),
+                        "certs": set(),
+                        "sales_notes_set": set(),
+                        "best_offer": None,
+                        "best_offer_rank": (-1, -1, -1, -math.inf),
+                    }
+                    groups_acc[gid] = g
+
+                g["total_sku_count"] += 1
+                if available:
+                    g["avail_sku_count"] += 1
+                    if not is_secondary:
+                        g["base_avail_sku_count"] += 1
+                    if price > 0:
+                        if price < g["min_avail_price"]:
+                            g["min_avail_price"] = price
+                        if price > g["max_avail_price"]:
+                            g["max_avail_price"] = price
+                if discount_pct > g["max_discount_pct"] and available:
+                    g["max_discount_pct"] = discount_pct
+                if is_ru_registry:
+                    g["is_ru_registry"] = True
+                    if registry_num and not g["registry_num"]:
+                        g["registry_num"] = registry_num
+                if platform and len(g["platforms"]) < 5:
+                    g["platforms"].add(platform[:50])
+                if version and len(g["versions"]) < 5:
+                    g["versions"].add(version[:25])
+                if certs and len(g["certs"]) < 4:
+                    g["certs"].add(certs[:40])
+                if sales_notes and len(g["sales_notes_set"]) < 4:
+                    g["sales_notes_set"].add(sales_notes)
+
+                # Pick flagship offer:
+                # Prefer available=True -> non-secondary (base license/device) -> commercial/universal -> has discount or affordable real price
+                comm_bonus = 1 if ("коммерч" in org_type.lower() or not org_type) else 0
+                has_real_price = 1 if price > 0 else 0
+                # Prefer moderate starting price among base commercial SKUs (negative log price so 1-seat / standard base SKU beats 1000-seat bundle)
+                price_pref = -math.log10(price + 10.0) if price > 0 else -99.0
+                cand_rank = (
+                    1 if available else 0,
+                    1 if not is_secondary else 0,
+                    has_real_price + comm_bonus,
+                    (1.5 if discount_pct > 0 else 0.0) + price_pref,
+                )
+                if cand_rank > g["best_offer_rank"]:
+                    g["best_offer_rank"] = cand_rank
+                    g["best_offer"] = offer_tuple
+
+                elem.clear()
+                while elem.getprevious() is not None:
+                    del elem.getparent()[0]
 
     print(
         f"    Parsed {len(categories):,} categories, {total_offers:,} offers "

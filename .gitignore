@@ -1,6 +1,7 @@
-# Large catalog feed (>100 MB GitHub limit) and generated local index artifacts
+# Uncompressed 292 MB raw XML (Mindbox.yml.gz is tracked in git instead)
 Mindbox.yml.gz.xml
 storage/
+Расчёт_стоимости_эксплуатации_Softline_AIForge.xlsx
 
 # Python artifacts & environments
 __pycache__/
@@ -13,7 +14,7 @@ env/
 .env
 *.log
 
-# Frontend dependencies (compiled dist/ is kept so `python run.py` works without Node.js)
+# Frontend dependencies (dist/ is pre-built so python run.py works without Node.js)
 frontend/node_modules/
 frontend/.vite/
 

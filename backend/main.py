@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from backend.data.build_index import DEFAULT_XML_PATH, STORAGE_DIR, build_catalog_index
+from backend.data.build_index import STORAGE_DIR, build_catalog_index
 from backend.engine.analytics_service import AnalyticsService
 from backend.engine.benchmark import run_full_benchmark
 from backend.engine.hybrid_search import SmartSearchEngine
@@ -45,7 +45,7 @@ def get_services() -> tuple[SmartSearchEngine, RecommendationEngine, AnalyticsSe
     global _search_engine, _recommender, _analytics
     if _search_engine is None:
         if not (STORAGE_DIR / "catalog.sqlite").exists():
-            build_catalog_index(DEFAULT_XML_PATH, STORAGE_DIR)
+            build_catalog_index(storage_dir=STORAGE_DIR)
         _search_engine = SmartSearchEngine(STORAGE_DIR)
         _recommender = RecommendationEngine(_search_engine)
         _analytics = AnalyticsService(STORAGE_DIR, _search_engine.catalog_stats)

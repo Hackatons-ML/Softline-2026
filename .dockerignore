@@ -4,4 +4,5 @@ __pycache__
 frontend/node_modules
 storage
 Mindbox.yml.gz.xml
+Расчёт_стоимости_эксплуатации_Softline_AIForge.xlsx
 *.log
